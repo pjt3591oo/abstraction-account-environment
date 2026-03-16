@@ -123,51 +123,179 @@ curl -X POST http://localhost:4337 \
   }'
 ```
 
-## ERC-4337 플로우
+## 실행 플로우
+
+### 페이마스터 없는 경우 (사용자가 직접 가스비 지불)
+
+스마트 계정에 ETH가 있어야 하며, EntryPoint가 가스비를 해당 계정의 deposit에서 차감합니다.
 
 ```
 Owner (EOA)
     │
     ▼
-┌─────────────────────────────────────────────┐
-│ 1. UserOperation 구성                        │
-│    - sender: 스마트 계정 주소 (counterfactual)│
-│    - initCode: 최초 배포 시 팩토리 호출       │
-│    - callData: 실행할 트랜잭션 인코딩         │
-│    - paymasterAndData: 페이마스터 서명 포함   │
-│    - signature: owner의 서명                  │
-└──────────────────┬──────────────────────────┘
-                   │
-                   ▼
-┌──────────────────────────────┐
-│ 2. Bundler (port 4337)       │
-│    - JSON-RPC로 UserOp 수신  │
-│    - 메모리풀에 저장          │
-│    - EntryPoint.handleOps()  │
-│      호출 (번들 제출)         │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ 3. EntryPoint (on-chain)     │
-│    - initCode → 팩토리 호출  │
-│      (계정 배포)             │
-│    - 서명 검증 (account)     │
-│    - 페이마스터 검증         │
-│    - callData 실행           │
-│    - 가스비 정산             │
-└──────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ 1. UserOperation 구성                         │
+│    - sender: 스마트 계정 주소 (counterfactual) │
+│    - initCode: 최초 배포 시 팩토리 호출        │
+│    - callData: account.execute() 인코딩       │
+│    - paymasterAndData: "0x" (비어있음)        │
+└──────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────┐
+│ 2. 서명 (1개)                                 │
+│    opHash = entryPoint.getUserOpHash(userOp)  │
+│    signature = owner.sign(opHash)             │
+└──────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────┐
+│ 3. EntryPoint.handleOps()                     │
+│                                               │
+│  ┌─ 검증 ─────────────────────────────────┐   │
+│  │ account.validateUserOp()               │   │
+│  │  └─ owner 서명 검증                     │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 배포 (initCode 있을 때만) ────────────┐   │
+│  │ factory.createAccount(owner, salt)     │   │
+│  │  └─ CREATE2로 스마트 계정 배포          │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 실행 ─────────────────────────────────┐   │
+│  │ account.execute(dest, value, data)     │   │
+│  │  └─ 실제 트랜잭션 수행                  │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 가스 정산 ────────────────────────────┐   │
+│  │ 스마트 계정의 deposit에서 가스비 차감 ✅ │   │
+│  └────────────────────────────────────────┘   │
+└──────────────────────────────────────────────┘
 ```
 
-## 서명 순서
+### 페이마스터 있는 경우 (가스비 대납)
 
-페이마스터와 owner의 서명 순서가 중요합니다:
+사용자 계정에 ETH가 없어도 됩니다. 페이마스터가 EntryPoint에 미리 deposit한 ETH에서 가스비가 차감됩니다.
 
-1. **UserOp 구성** (paymasterAndData에 더미 서명)
-2. **Paymaster 서명** → `paymaster.getHash()` → 서명 → paymasterAndData 완성
-3. **Owner 서명** → `entryPoint.getUserOpHash()` → 서명 (paymasterAndData 포함된 최종 해시)
+```
+Owner (EOA)                    PaymasterSigner (EOA)
+    │                                │
+    ▼                                │
+┌──────────────────────────────────────────────┐
+│ 1. UserOperation 구성                         │
+│    - sender: 스마트 계정 주소 (counterfactual) │
+│    - initCode: 최초 배포 시 팩토리 호출        │
+│    - callData: account.execute() 인코딩       │
+│    - paymasterAndData: 더미 서명으로 초기 구성  │
+└──────────────────────────────────────────────┘
+    │                                │
+    ▼                                ▼
+┌──────────────────────────────────────────────┐
+│ 2. 서명 (2개, 순서 중요!)                      │
+│                                               │
+│  ① Paymaster 서명 (먼저)                      │
+│     pmHash = paymaster.getHash(userOp, ...)   │
+│     pmSig = paymasterSigner.sign(pmHash)      │
+│     → paymasterAndData에 서명 삽입             │
+│                                               │
+│  ② Owner 서명 (나중에)                         │
+│     opHash = entryPoint.getUserOpHash(userOp) │
+│     signature = owner.sign(opHash)            │
+│     → paymasterAndData 포함된 최종 해시에 서명  │
+└──────────────────────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────┐
+│ 3. EntryPoint.handleOps()                     │
+│                                               │
+│  ┌─ 검증 (2단계) ─────────────────────────┐   │
+│  │ account.validateUserOp()               │   │
+│  │  └─ owner 서명 검증                     │   │
+│  │ paymaster.validatePaymasterUserOp()    │   │
+│  │  └─ paymaster 서명 검증                 │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 배포 (initCode 있을 때만) ────────────┐   │
+│  │ factory.createAccount(owner, salt)     │   │
+│  │  └─ CREATE2로 스마트 계정 배포          │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 실행 ─────────────────────────────────┐   │
+│  │ account.execute(dest, value, data)     │   │
+│  │  └─ 실제 트랜잭션 수행                  │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 가스 정산 ────────────────────────────┐   │
+│  │ 페이마스터의 deposit에서 가스비 차감 ✅  │   │
+│  └────────────────────────────────────────┘   │
+│              │                                │
+│              ▼                                │
+│  ┌─ 후처리 (선택) ────────────────────────┐   │
+│  │ paymaster.postOp()                     │   │
+│  │  └─ ERC-20 토큰 수금 등 후처리 로직     │   │
+│  └────────────────────────────────────────┘   │
+└──────────────────────────────────────────────┘
+```
 
-owner의 서명이 paymasterAndData를 포함하므로, 반드시 페이마스터가 먼저 서명해야 합니다.
+### 컨트랙트 호출 비교표
+
+| 단계 | 페이마스터 없음 | 페이마스터 있음 |
+|------|----------------|----------------|
+| **서명 수** | Owner 1개 | Paymaster + Owner 2개 |
+| **검증** | `account.validateUserOp()` | `account.validateUserOp()` + `paymaster.validatePaymasterUserOp()` |
+| **실행** | `account.execute()` | `account.execute()` (동일) |
+| **가스 지불** | 스마트 계정 deposit | 페이마스터 deposit |
+| **후처리** | 없음 | `paymaster.postOp()` (선택) |
+
+### 번들러 경유 플로우
+
+위 두 플로우 모두 번들러를 통해 제출할 수 있습니다. 번들러는 UserOp을 수집하여 EntryPoint에 중계하는 역할입니다.
+
+```
+Client                    Bundler (port 4337)              EntryPoint (on-chain)
+  │                            │                                │
+  │  eth_sendUserOperation     │                                │
+  │ ─────────────────────────► │                                │
+  │                            │  mempool에 저장                │
+  │                            │  tryBuild() 실행               │
+  │                            │                                │
+  │                            │  handleOps([userOps], beneficiary)
+  │                            │ ─────────────────────────────► │
+  │                            │                                │  검증 → 배포 → 실행 → 정산
+  │                            │                                │
+  │                            │  UserOperationEvent 로그 파싱  │
+  │  ◄─────────────────────── │  ◄───────────────────────────── │
+  │  userOpHash 반환           │                                │
+```
+
+### 서명 순서가 중요한 이유
+
+```
+Owner의 서명 = sign(hash(userOp 전체))
+                          ↑
+                paymasterAndData 포함!
+```
+
+Owner의 서명이 `paymasterAndData`(페이마스터 서명 포함)를 커버하기 때문에, **페이마스터가 먼저 서명**해야 합니다. 이렇게 해야 중간에 누군가 페이마스터 정보를 변조할 수 없습니다.
+
+이 프로젝트의 `scripts/run-full-flow.ts`에서 전체 서명 순서를 확인할 수 있습니다:
+
+```
+① factory.getAddress(owner, salt)      → 계정 주소 미리 계산 (CREATE2)
+② buildInitCode(factory, owner, salt)  → initCode 생성
+③ encodeExecute(to, value, "0x")       → callData 생성
+④ paymaster.getHash(userOp, ...)       → 페이마스터 해시 계산
+⑤ paymasterSigner.sign(pmHash)         → 페이마스터 서명 (1차)
+⑥ entryPoint.getUserOpHash(userOp)     → UserOp 해시 계산
+⑦ owner.sign(opHash)                   → 오너 서명 (2차)
+⑧ entryPoint.handleOps([userOp], ...)  → 실행
+```
 
 ## PackedUserOperation (v0.7)
 
